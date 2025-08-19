@@ -20,6 +20,7 @@ class YoloV8Tflite(
     val HOME_CLASS_IDS = setOf(56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75)
 
     private var gpuDelegate: GpuDelegate? = null
+    private val JET_LUT: IntArray by lazy { buildJetLUT() }
 
     private val interpreter: Interpreter by lazy {
         val bytes = assetManager.open(modelPath).readBytes()
@@ -148,14 +149,15 @@ class YoloV8Tflite(
         srcW: Int,
         srcH: Int,
         dets: List<Detection>,
-        downsample: Int = 4,          // calcula en baja res y reescala
-        sigmaFactor: Float = 0.25f,   // qué tan “anchas” son las manchas (relativo a la caja)
-        alpha: Int = 0x66             // transparencia del overlay (0x00–0xFF)
+        downsample: Int = 4,
+        sigmaFactor: Float = 0.25f,
+        alpha: Int = 0x66  // 0x00–0xFF
     ): Bitmap {
         val w = maxOf(1, srcW / downsample)
         val h = maxOf(1, srcH / downsample)
         val field = FloatArray(w * h)
 
+        // 1) Acumular "gaussian splats" por detección (ponderado por score)
         for (d in dets) {
             val cx = ((d.box.left + d.box.right) * 0.5f) / downsample
             val cy = ((d.box.top + d.box.bottom) * 0.5f) / downsample
@@ -180,7 +182,7 @@ class YoloV8Tflite(
                     val dx2 = (x - cx) * (x - cx)
                     val g = kotlin.math.exp(-dx2 / twoSigmaX2 - dy2 / twoSigmaY2).toFloat()
                     val idx = y * w + x
-                    // usa max para que “gane” la mancha con mayor score
+                    // max-pooling para que gane la mancha más intensa
                     field[idx] = maxOf(field[idx], g * d.score)
                     x++
                 }
@@ -188,20 +190,47 @@ class YoloV8Tflite(
             }
         }
 
-        // normaliza a [0,1] y coloriza
+        // 2) Normalizar a [0,1]
         var mn = Float.POSITIVE_INFINITY; var mx = Float.NEGATIVE_INFINITY
         for (v in field) { if (v < mn) mn = v; if (v > mx) mx = v }
         val range = if (mx > mn) (mx - mn) else 1f
 
+        // 3) Mapear a 0..255 y aplicar LUT Jet
         val px = IntArray(w * h)
+        val a = (alpha and 0xFF) shl 24
         for (i in field.indices) {
-            val v = ((field[i] - mn) / range).coerceIn(0f, 1f)
-            val c = jetColor(v) // colormap
-            px[i] = ((alpha and 0xFF) shl 24) or c
+            val v01 = ((field[i] - mn) / range).coerceIn(0f, 1f)
+            val idx = (v01 * 255f + 0.5f).toInt().coerceIn(0, 255)
+            px[i] = a or (JET_LUT[idx] and 0x00FFFFFF)  // ARGB con alpha fijo
         }
+
+        // 4) Bitmap a baja res y reescalar al tamaño original
         val small = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         small.setPixels(px, 0, w, 0, 0, w, h)
         return Bitmap.createScaledBitmap(small, srcW, srcH, true)
+    }
+
+    /** Construye una LUT tipo 'jet' (256 colores). */
+    private fun buildJetLUT(): IntArray {
+        val lut = IntArray(256)
+        for (i in 0..255) {
+            val x = i / 255f
+            // Jet aproximado en tres lóbulos (sin gamma):
+            val r = clamp01(1.5f - kotlin.math.abs(4f * x - 3f))
+            val g = clamp01(1.5f - kotlin.math.abs(4f * x - 2f))
+            val b = clamp01(1.5f - kotlin.math.abs(4f * x - 1f))
+            val R = (r * 255f + 0.5f).toInt()
+            val G = (g * 255f + 0.5f).toInt()
+            val B = (b * 255f + 0.5f).toInt()
+            lut[i] = (R shl 16) or (G shl 8) or B
+        }
+        return lut
+    }
+
+    private fun clamp01(v: Float): Float = when {
+        v < 0f -> 0f
+        v > 1f -> 1f
+        else -> v
     }
 
     private fun jetColor(v: Float): Int {
