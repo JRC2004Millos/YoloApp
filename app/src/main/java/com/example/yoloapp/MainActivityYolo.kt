@@ -24,6 +24,7 @@ class MainActivityYolo : ComponentActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var imageView: ImageView
     private lateinit var overlay: BoxOverlay
+    private lateinit var heatmapView: ImageView
     private lateinit var fabPick: FloatingActionButton
     private lateinit var fabCamera: FloatingActionButton
 
@@ -31,6 +32,7 @@ class MainActivityYolo : ComponentActivity() {
     private lateinit var yolo: YoloV8Tflite
     private lateinit var yuvToRgb: YuvToRgbConverter
 
+    private var frameCount = 0
     private var cameraProvider: ProcessCameraProvider? = null
     private var imageAnalysis: ImageAnalysis? = null
 
@@ -53,6 +55,7 @@ class MainActivityYolo : ComponentActivity() {
         previewView = findViewById(R.id.previewView)
         imageView = findViewById(R.id.imageView)
         overlay = findViewById(R.id.boxOverlay)
+        heatmapView = findViewById(R.id.heatmapView)
         fabPick = findViewById(R.id.fabPick)
         fabCamera = findViewById(R.id.fabCamera)
 
@@ -64,7 +67,8 @@ class MainActivityYolo : ComponentActivity() {
         fabCamera.setOnClickListener { switchToCamera() }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) {
+            == PackageManager.PERMISSION_GRANTED
+        ) {
             startCamera()
         } else {
             reqCameraPerm.launch(Manifest.permission.CAMERA)
@@ -98,10 +102,13 @@ class MainActivityYolo : ComponentActivity() {
                     preview,
                     imageAnalysis
                 )
-                // Mostrar cámara
+
+                // mostrar cámara
                 previewView.visibility = View.VISIBLE
                 imageView.visibility = View.GONE
                 overlay.setBoxes(emptyList())
+                heatmapView.setImageDrawable(null)
+                heatmapView.visibility = View.GONE
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -112,15 +119,30 @@ class MainActivityYolo : ComponentActivity() {
         try {
             val bmp = yuvToRgb.toBitmap(imageProxy)
             val dets = yolo.run(bmp, confThr = 0.25f, keepOnlyHome = true)
-            android.util.Log.d("YOLO", "Detections (cam): ${dets.size}")
-            dets.take(3).forEachIndexed { i, d ->
-                android.util.Log.d("YOLO", "#$i cls=${d.clsId} score=${"%.2f".format(d.score)} box=${d.box}")
-            }
+
             val boxes = dets.map {
                 val label = yolo.labels.getOrNull(it.clsId) ?: "cls ${it.clsId}"
                 Box(it.box, label, it.score)
             }
-            runOnUiThread { overlay.setBoxes(boxes) }
+
+            // Calcula el heatmap cada 3 frames para no cargar la CPU/GPU
+            val drawHeat = (frameCount++ % 3 == 0)
+            val heatmapBitmap = if (drawHeat) {
+                yolo.heatmapFromDetections(
+                    bmp.width, bmp.height, dets,
+                    downsample = 6,      // 6–8 suele ir bien en móvil
+                    sigmaFactor = 0.22f, // ancho del “glow”
+                    alpha = 0x66         // transparencia del overlay
+                )
+            } else null
+
+            runOnUiThread {
+                overlay.setBoxes(boxes)
+                if (heatmapBitmap != null) {
+                    heatmapView.setImageBitmap(heatmapBitmap)
+                    heatmapView.visibility = View.VISIBLE
+                }
+            }
         } catch (t: Throwable) {
             t.printStackTrace()
         } finally {
@@ -133,6 +155,7 @@ class MainActivityYolo : ComponentActivity() {
         previewView.visibility = View.GONE
         imageView.visibility = View.VISIBLE
         overlay.setBoxes(emptyList())
+        // deja visible el heatmap si quieres ver la imagen con overlay
     }
 
     private fun switchToCamera() {
@@ -145,13 +168,20 @@ class MainActivityYolo : ComponentActivity() {
         imageView.setImageBitmap(bmp)
 
         val dets = yolo.run(bmp, confThr = 0.25f, keepOnlyHome = true)
-        android.util.Log.d("YOLO", "Detections (img): ${dets.size}")
-
-        val boxes = dets.map {
+        overlay.setBoxes(dets.map {
             val label = yolo.labels.getOrNull(it.clsId) ?: "cls ${it.clsId}"
             Box(it.box, label, it.score)
-        }
-        overlay.setBoxes(boxes)
+        })
+
+        // Heatmap para imagen estática (parámetros algo más finos si quieres)
+        val hm = yolo.heatmapFromDetections(
+            bmp.width, bmp.height, dets,
+            downsample = 4,
+            sigmaFactor = 0.25f,
+            alpha = 0x66
+        )
+        heatmapView.setImageBitmap(hm)
+        heatmapView.visibility = View.VISIBLE
     }
 
     private fun decodeUriToBitmap(uri: Uri, maxSize: Int = 1600): Bitmap? {
@@ -175,5 +205,6 @@ class MainActivityYolo : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
+        try { yolo.close() } catch (_: Throwable) {}
     }
 }

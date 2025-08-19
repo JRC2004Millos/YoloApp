@@ -143,6 +143,75 @@ class YoloV8Tflite(
         return dets
     }
 
+    // YoloV8Tflite.kt
+    fun heatmapFromDetections(
+        srcW: Int,
+        srcH: Int,
+        dets: List<Detection>,
+        downsample: Int = 4,          // calcula en baja res y reescala
+        sigmaFactor: Float = 0.25f,   // qué tan “anchas” son las manchas (relativo a la caja)
+        alpha: Int = 0x66             // transparencia del overlay (0x00–0xFF)
+    ): Bitmap {
+        val w = maxOf(1, srcW / downsample)
+        val h = maxOf(1, srcH / downsample)
+        val field = FloatArray(w * h)
+
+        for (d in dets) {
+            val cx = ((d.box.left + d.box.right) * 0.5f) / downsample
+            val cy = ((d.box.top + d.box.bottom) * 0.5f) / downsample
+            val bw = (d.box.right - d.box.left) / downsample
+            val bh = (d.box.bottom - d.box.top) / downsample
+
+            val sigmaX = (bw * sigmaFactor).coerceAtLeast(1f)
+            val sigmaY = (bh * sigmaFactor).coerceAtLeast(1f)
+            val twoSigmaX2 = 2f * sigmaX * sigmaX
+            val twoSigmaY2 = 2f * sigmaY * sigmaY
+
+            val x0 = maxOf(0, kotlin.math.floor(cx - 3f * sigmaX).toInt())
+            val x1 = minOf(w - 1, kotlin.math.ceil (cx + 3f * sigmaX).toInt())
+            val y0 = maxOf(0, kotlin.math.floor(cy - 3f * sigmaY).toInt())
+            val y1 = minOf(h - 1, kotlin.math.ceil (cy + 3f * sigmaY).toInt())
+
+            var y = y0
+            while (y <= y1) {
+                val dy2 = (y - cy) * (y - cy)
+                var x = x0
+                while (x <= x1) {
+                    val dx2 = (x - cx) * (x - cx)
+                    val g = kotlin.math.exp(-dx2 / twoSigmaX2 - dy2 / twoSigmaY2).toFloat()
+                    val idx = y * w + x
+                    // usa max para que “gane” la mancha con mayor score
+                    field[idx] = maxOf(field[idx], g * d.score)
+                    x++
+                }
+                y++
+            }
+        }
+
+        // normaliza a [0,1] y coloriza
+        var mn = Float.POSITIVE_INFINITY; var mx = Float.NEGATIVE_INFINITY
+        for (v in field) { if (v < mn) mn = v; if (v > mx) mx = v }
+        val range = if (mx > mn) (mx - mn) else 1f
+
+        val px = IntArray(w * h)
+        for (i in field.indices) {
+            val v = ((field[i] - mn) / range).coerceIn(0f, 1f)
+            val c = jetColor(v) // colormap
+            px[i] = ((alpha and 0xFF) shl 24) or c
+        }
+        val small = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        small.setPixels(px, 0, w, 0, 0, w, h)
+        return Bitmap.createScaledBitmap(small, srcW, srcH, true)
+    }
+
+    private fun jetColor(v: Float): Int {
+        val four = 4 * v
+        val r = ((minOf(four - 1.5f, -four + 4.5f, 1f).coerceAtLeast(0f)) * 255).toInt()
+        val g = ((minOf(four - 0.5f, -four + 3.5f, 1f).coerceAtLeast(0f)) * 255).toInt()
+        val b = ((minOf(four + 0.5f, -four + 2.5f, 1f).coerceAtLeast(0f)) * 255).toInt()
+        return ((r and 0xFF) shl 16) or ((g and 0xFF) shl 8) or (b and 0xFF)
+    }
+
     companion object {
         val COCO = listOf(
             "person","bicycle","car","motorcycle","airplane","bus","train","truck","boat","traffic light",
